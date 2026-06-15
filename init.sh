@@ -76,10 +76,10 @@ ip6tables -A INPUT -p icmpv6 -j ACCEPT
 ip6tables -A INPUT -s fe80::/10 -d fe80::/10 -p udp --dport 546 -j ACCEPT
 
 # ------------------------------------------------------------
-# 5. 双栈放行业务端口（22 SSH, 80/443 Web, 10000 1Panel）
+# 5. 双栈放行业务端口（22 SSH, 80/443 Web, 65510 1Panel）
 # ------------------------------------------------------------
 echo -e "${GREEN}[5/6] 双栈放行 SSH / Web / 1Panel 端口${NC}"
-PORTS=(22 80 443 10000)
+PORTS=(22 80 443 65510)
 for PORT in "${PORTS[@]}"; do
     iptables -A INPUT -p tcp --dport "$PORT" -j ACCEPT
     ip6tables -A INPUT -p tcp --dport "$PORT" -j ACCEPT
@@ -126,7 +126,7 @@ echo -e "${YELLOW}⚠️  重要提醒（请务必按顺序执行）：${NC}"
 echo ""
 echo -e "1️⃣  ${YELLOW}网页控制台放行端口${NC}"
 echo "   登录 Oracle Cloud 控制台 → 虚拟云网络(VCN) → 安全列表(Security List)"
-echo "   添加入站规则，放行 TCP: 22, 80, 443, 10000"
+echo "   添加入站规则，放行 TCP: 22, 80, 443, 65510"
 echo ""
 echo -e "2️⃣ ${YELLOW}安装 1Panel${NC}"
 echo "   bash -c \"\$(curl -fsSL https://resource.fit2cloud.com/1panel/package/v2/quick_start.sh)\""
