@@ -1,22 +1,32 @@
-
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
-# OCI Ubuntu 26.04 LTS 安全初始化脚本
+# OCI Ubuntu 26.04 LTS 基础初始化
 #
 # 适用：Oracle Cloud ARM / AMD Ubuntu 26.04
 # 功能：
-#   1. 自动识别默认网卡
-#   2. Netplan 持久化 MTU 1500
-#   3. TCP BBR + fq
-#   4. IPv4 / IPv6 基础防火墙
-#   5. Docker DOCKER-USER 链兼容
-#   6. iptables-persistent 规则持久化
-#   7. 默认放行 WiFi Calling UDP 500 / 4500
+#   1. 检查系统版本、权限和 CPU 架构
+#   2. 自动识别默认网卡
+#   3. Netplan 持久化 MTU 1500
+#   4. TCP BBR + fq（内核支持时启用）
+#   5. 备份配置、验证执行结果
 #
-# 注意：建议新系统首次安装 1Panel 前运行
+# 防火墙策略：
+#   - 不清空 iptables / ip6tables / nftables
+#   - 不修改默认防火墙策略
+#   - 不创建 1PANEL_* 或 DOCKER-USER 链
+#   - 不安装或启用 iptables-persistent
+#   - 不修改 SSH 端口或放行任何入站端口
+#
+# 端口规划：
+#   当前 SSH：22
+#   1Panel：65510
+#   未来 SSH：65511
+#
+# 建议在新实例安装 1Panel 前运行
 # ============================================================
 
 set -Eeuo pipefail
+umask 077
 
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -24,107 +34,126 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-echo -e "${GREEN}OCI Ubuntu 26.04 安全初始化${NC}"
+log()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
+die()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+
+trap 'rc=$?; echo -e "${RED}[ERROR] 第 ${LINENO} 行执行失败，退出码 ${rc}${NC}" >&2; exit "$rc"' ERR
+
+echo -e "${GREEN}"
+echo "============================================================"
+echo " OCI Ubuntu 26.04 基础初始化"
+echo " 防火墙交由后续 1Panel 初始化和管理"
+echo "============================================================"
+echo -e "${NC}"
 
 # ------------------------------------------------------------
-# 0. 权限与系统版本检查
+# 1. 权限与系统版本检查
 # ------------------------------------------------------------
-if [[ "$EUID" -ne 0 ]]; then
-    echo -e "${RED}请使用 root 执行：sudo -i${NC}"
-    exit 1
-fi
+[[ "$EUID" -eq 0 ]] || die "请使用 root 运行：sudo -i"
 
-if [[ ! -r /etc/os-release ]]; then
-    echo -e "${RED}无法识别操作系统版本，退出。${NC}"
-    exit 1
-fi
+[[ -r /etc/os-release ]] || die "无法读取系统版本信息"
+# shellcheck disable=SC1091
+source /etc/os-release
 
-. /etc/os-release
+[[ "${ID:-}" == "ubuntu" ]] ||
+    die "仅支持 Ubuntu，当前系统：${PRETTY_NAME:-unknown}"
 
-if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != "26.04" ]]; then
-    echo -e "${RED}本脚本仅允许在 Ubuntu 26.04 上执行。${NC}"
-    echo -e "${YELLOW}当前系统：${PRETTY_NAME:-unknown}${NC}"
-    exit 1
-fi
+[[ "${VERSION_ID:-}" == "26.04" ]] ||
+    die "本脚本仅支持 Ubuntu 26.04，当前：${VERSION_ID:-unknown}"
 
-# 防止重复执行时意外清空已投入使用的防火墙规则
-if [[ -e /etc/1panel ]] || systemctl is-active --quiet docker 2>/dev/null; then
-    echo -e "${RED}检测到 1Panel 配置目录或正在运行的 Docker。${NC}"
-    echo -e "${YELLOW}为避免破坏现有规则，请勿直接执行本初始化脚本。${NC}"
-    echo "请先检查现有防火墙和 Docker 规则，再决定如何迁移。"
-    exit 1
-fi
+ARCH="$(dpkg --print-architecture)"
+case "$ARCH" in
+    arm64|amd64) ;;
+    *) die "不支持的 CPU 架构：$ARCH（仅支持 arm64 / amd64）" ;;
+esac
 
-# ------------------------------------------------------------
-# 1. 自动识别默认网卡
-# ------------------------------------------------------------
-echo -e "${GREEN}[1/6] 识别默认网卡${NC}"
-
-DEFAULT_ETH=$(ip -4 route show default |
-    awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}')
-
-if [[ -z "$DEFAULT_ETH" ]]; then
-    echo -e "${RED}未发现 IPv4 默认路由，无法安全配置网卡。${NC}"
-    exit 1
-fi
-
-if ! ip link show dev "$DEFAULT_ETH" >/dev/null 2>&1; then
-    echo -e "${RED}网卡不存在：${DEFAULT_ETH}${NC}"
-    exit 1
-fi
-
-echo -e "${BLUE}默认网卡：${DEFAULT_ETH}${NC}"
-
-# ------------------------------------------------------------
-# 2. 检查并安装系统组件
-# ------------------------------------------------------------
-echo -e "${GREEN}[2/6] 检查系统组件${NC}"
-
-export DEBIAN_FRONTEND=noninteractive
-
-apt-get update -qq
-
-if ! dpkg -s iptables-persistent >/dev/null 2>&1; then
-    # 避免安装时交互询问是否保存旧规则
-    echo iptables-persistent iptables-persistent/autosave_v4 boolean false \
-        | debconf-set-selections
-    echo iptables-persistent iptables-persistent/autosave_v6 boolean false \
-        | debconf-set-selections
-
-    apt-get install -y iptables iptables-persistent netplan.io
-else
-    apt-get install -y iptables netplan.io
-fi
-
-for cmd in iptables ip6tables iptables-save ip6tables-save netplan; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo -e "${RED}缺少必要命令：${cmd}${NC}"
-        exit 1
-    fi
+for cmd in ip awk grep sysctl apt-get dpkg; do
+    command -v "$cmd" >/dev/null 2>&1 ||
+        die "缺少必要命令：$cmd"
 done
 
-# 确认 IPv6 防火墙可用
-ip6tables -L -n >/dev/null
+# ------------------------------------------------------------
+# 2. 自动识别默认网卡
+# ------------------------------------------------------------
+log "检测默认网卡"
+
+DEFAULT_ETH="$(
+    ip -4 route show default 2>/dev/null |
+    awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}'
+)"
+
+if [[ -z "$DEFAULT_ETH" ]]; then
+    DEFAULT_ETH="$(
+        ip -6 route show default 2>/dev/null |
+        awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}'
+    )"
+fi
+
+[[ -n "$DEFAULT_ETH" ]] || die "未找到 IPv4 或 IPv6 默认路由"
+[[ -e "/sys/class/net/$DEFAULT_ETH" ]] ||
+    die "网卡不存在：$DEFAULT_ETH"
+
+MAC="$(cat "/sys/class/net/$DEFAULT_ETH/address")"
+[[ -n "$MAC" ]] || die "无法读取网卡 MAC 地址"
+
+log "系统：${PRETTY_NAME}"
+log "架构：${ARCH}"
+log "默认网卡：${DEFAULT_ETH}"
+log "MAC 地址：${MAC}"
+
+ip -brief address show dev "$DEFAULT_ETH"
 
 # ------------------------------------------------------------
-# 3. MTU 1500：Netplan 持久化
+# 3. 备份配置
 # ------------------------------------------------------------
-echo -e "${GREEN}[3/6] 设置 MTU 1500${NC}"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+BACKUP_DIR="/root/oci-init-backup-${STAMP}"
+
+mkdir -m 700 -p "$BACKUP_DIR"
 
 NETPLAN_DIR="/etc/netplan"
 NETPLAN_FILE="${NETPLAN_DIR}/99-oci-init.yaml"
-NETPLAN_BACKUP="/root/netplan-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+SYSCTL_FILE="/etc/sysctl.d/99-oci-init.conf"
 
 mkdir -p "$NETPLAN_DIR"
 
-# 备份原始配置
+# 备份现有 Netplan 文件和本脚本涉及的 sysctl 文件
 if compgen -G "${NETPLAN_DIR}/*.yaml" >/dev/null; then
-    tar -czf "$NETPLAN_BACKUP" -C /etc netplan
-    echo -e "${BLUE}Netplan 备份：${NETPLAN_BACKUP}${NC}"
+    tar -czf "${BACKUP_DIR}/netplan-backup.tar.gz" \
+        -C /etc netplan
 fi
 
-# 先生成独立配置并验证合并后的 Netplan 配置
-cat > "${NETPLAN_FILE}.tmp" <<EOF
+if [[ -e "$NETPLAN_FILE" ]]; then
+    cp -a "$NETPLAN_FILE" "${BACKUP_DIR}/99-oci-init.yaml"
+fi
+
+if [[ -e "$SYSCTL_FILE" ]]; then
+    cp -a "$SYSCTL_FILE" "${BACKUP_DIR}/99-oci-init.conf"
+fi
+
+log "配置备份目录：${BACKUP_DIR}"
+
+# ------------------------------------------------------------
+# 4. 检查 Netplan
+# ------------------------------------------------------------
+if ! command -v netplan >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y netplan.io
+fi
+
+command -v netplan >/dev/null 2>&1 ||
+    die "Netplan 安装失败"
+
+# ------------------------------------------------------------
+# 5. Netplan 持久化 MTU 1500
+# ------------------------------------------------------------
+log "配置 MTU 1500"
+
+TMP_FILE="${NETPLAN_FILE}.tmp"
+
+cat > "$TMP_FILE" <<EOF
 network:
   version: 2
   ethernets:
@@ -132,168 +161,146 @@ network:
       mtu: 1500
 EOF
 
-mv "${NETPLAN_FILE}.tmp" "$NETPLAN_FILE"
+chmod 600 "$TMP_FILE"
+mv "$TMP_FILE" "$NETPLAN_FILE"
 
+# 验证合并后的 Netplan 配置
 if ! netplan generate; then
-    echo -e "${RED}Netplan 配置验证失败。${NC}"
-    echo -e "${YELLOW}请检查 ${NETPLAN_FILE} 和其他 Netplan 文件。${NC}"
-    exit 1
+    warn "Netplan 验证失败，恢复本脚本原有配置"
+
+    if [[ -e "${BACKUP_DIR}/99-oci-init.yaml" ]]; then
+        cp -a "${BACKUP_DIR}/99-oci-init.yaml" "$NETPLAN_FILE"
+    else
+        rm -f "$NETPLAN_FILE"
+    fi
+
+    netplan generate || true
+    die "Netplan 配置验证失败，已尝试回滚"
 fi
 
-# 立即生效
+# 先设置当前 MTU，再应用持久化配置
 ip link set dev "$DEFAULT_ETH" mtu 1500
 
 if ! netplan apply; then
-    echo -e "${YELLOW}Netplan apply 失败，请检查配置和控制台连接。${NC}"
+    warn "netplan apply 失败，尝试恢复本脚本之前的配置"
+
+    if [[ -e "${BACKUP_DIR}/99-oci-init.yaml" ]]; then
+        cp -a "${BACKUP_DIR}/99-oci-init.yaml" "$NETPLAN_FILE"
+    else
+        rm -f "$NETPLAN_FILE"
+    fi
+
+    netplan generate || true
+    netplan apply || true
+
+    die "Netplan 应用失败，请通过 OCI 控制台检查网络"
 fi
 
+CURRENT_MTU="$(cat "/sys/class/net/$DEFAULT_ETH/mtu")"
+[[ "$CURRENT_MTU" == "1500" ]] ||
+    die "MTU 验证失败，当前值：${CURRENT_MTU}"
+
+log "MTU 当前值：${CURRENT_MTU}"
+log "持久化配置：${NETPLAN_FILE}"
+
 # ------------------------------------------------------------
-# 4. TCP BBR + fq
+# 6. TCP BBR + fq
 # ------------------------------------------------------------
-echo -e "${GREEN}[4/6] 配置 TCP BBR${NC}"
+log "检测内核 BBR 支持"
 
 modprobe tcp_bbr 2>/dev/null || true
 
-cat > /etc/sysctl.d/99-oci-init.conf <<'EOF'
-# OCI 网络基础优化
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
+AVAILABLE_CC="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+
+if awk -v cc="$AVAILABLE_CC" '
+    BEGIN {
+        n = split(cc, a, /[[:space:]]+/)
+        for (i=1; i<=n; i++) if (a[i] == "bbr") found=1
+        exit !found
+    }'
+then
+    cat > "$SYSCTL_FILE" <<'EOF'
+# OCI 基础 TCP 优化
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
 EOF
 
-sysctl --system >/dev/null
+    chmod 644 "$SYSCTL_FILE"
+    sysctl -p "$SYSCTL_FILE"
 
-CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control)
-CURRENT_QDISC=$(sysctl -n net.core.default_qdisc)
+    CURRENT_CC="$(sysctl -n net.ipv4.tcp_congestion_control)"
+    CURRENT_QDISC="$(sysctl -n net.core.default_qdisc)"
 
-if [[ "$CURRENT_CC" != "bbr" ]]; then
-    echo -e "${YELLOW}BBR 未成功启用，请检查内核支持。${NC}"
+    [[ "$CURRENT_CC" == "bbr" ]] ||
+        die "BBR 配置未生效"
+    [[ "$CURRENT_QDISC" == "fq" ]] ||
+        warn "fq 未能按预期生效，当前值：${CURRENT_QDISC}"
+
+    log "BBR：${CURRENT_CC}"
+    log "队列算法：${CURRENT_QDISC}"
+else
+    warn "当前内核未报告支持 BBR，本脚本不强制设置"
+    warn "保留现有拥塞控制配置，不覆盖其他 sysctl 参数"
 fi
 
-echo -e "${BLUE}拥塞控制：${CURRENT_CC} | 队列算法：${CURRENT_QDISC}${NC}"
+# ------------------------------------------------------------
+# 7. 防火墙安全检查（只检查，不修改）
+# ------------------------------------------------------------
+log "检查防火墙状态（不会修改规则）"
+
+if command -v iptables >/dev/null 2>&1; then
+    iptables -S INPUT 2>/dev/null || true
+else
+    warn "未发现 iptables 命令"
+fi
+
+if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -S INPUT 2>/dev/null || true
+else
+    warn "未发现 ip6tables 命令"
+fi
+
+if command -v nft >/dev/null 2>&1; then
+    nft list ruleset 2>/dev/null || true
+fi
 
 # ------------------------------------------------------------
-# 5. IPv4 / IPv6 基础防火墙
-# ------------------------------------------------------------
-echo -e "${GREEN}[5/6] 配置双栈防火墙${NC}"
-
-# 警告：以下会清空现有 iptables / ip6tables 规则。
-# 仅适用于新系统首次初始化，不应直接用于已有业务的主机。
-
-# 5.1 先设置 ACCEPT，避免清理规则时立即中断现有连接
-iptables -P INPUT ACCEPT
-iptables -P FORWARD ACCEPT
-iptables -P OUTPUT ACCEPT
-
-ip6tables -P INPUT ACCEPT
-ip6tables -P FORWARD ACCEPT
-ip6tables -P OUTPUT ACCEPT
-
-# 清理 filter、nat、mangle、raw 表的旧规则
-for table in filter nat mangle raw; do
-    iptables -t "$table" -F
-    iptables -t "$table" -X
-    ip6tables -t "$table" -F
-    ip6tables -t "$table" -X
-done
-
-# 5.2 默认策略：拒绝入站和转发，允许出站
-iptables -P INPUT DROP
-iptables -P FORWARD DROP
-iptables -P OUTPUT ACCEPT
-
-ip6tables -P INPUT DROP
-ip6tables -P FORWARD DROP
-ip6tables -P OUTPUT ACCEPT
-
-# 5.3 本地环回与已建立连接
-iptables -A INPUT -i lo -j ACCEPT
-iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-ip6tables -A INPUT -i lo -j ACCEPT
-ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-# OCI 元数据服务（IPv4）
-iptables -A INPUT -s 169.254.169.254/32 -j ACCEPT
-iptables -A OUTPUT -d 169.254.169.254/32 -j ACCEPT
-
-# IPv6：ICMPv6 邻居发现、路径 MTU 等基础功能
-ip6tables -A INPUT -p ipv6-icmp -j ACCEPT
-
-# DHCPv6 客户端响应（如使用 DHCPv6）
-ip6tables -A INPUT -s fe80::/10 -p udp --sport 547 --dport 546 -j ACCEPT
-
-# 5.4 基础 TCP 端口：22 / 80 / 443 / 65510
-TCP_PORTS=(22 80 443 65510)
-
-for p in "${TCP_PORTS[@]}"; do
-    iptables -A INPUT -p tcp --dport "$p" \
-        -m conntrack --ctstate NEW -j ACCEPT
-
-    ip6tables -A INPUT -p tcp --dport "$p" \
-        -m conntrack --ctstate NEW -j ACCEPT
-
-    echo -e "${BLUE}放行 TCP/${p}（IPv4/IPv6）${NC}"
-done
-
-# 5.5 WiFi Calling：IKE / IPsec NAT-T
-# UDP 500  = IKE
-# UDP 4500 = IPsec NAT Traversal
-WFC_UDP_PORTS=(500 4500)
-
-for p in "${WFC_UDP_PORTS[@]}"; do
-    iptables -A INPUT -p udp --dport "$p" \
-        -m conntrack --ctstate NEW -j ACCEPT
-
-    ip6tables -A INPUT -p udp --dport "$p" \
-        -m conntrack --ctstate NEW -j ACCEPT
-
-    echo -e "${BLUE}放行 UDP/${p}（IPv4/IPv6）${NC}"
-done
-
-# 5.6 DOCKER-USER 链
-# Docker 尚未安装时预先创建规则入口。
-# Docker 启动后会使用此链；RETURN 表示继续后续 Docker 规则处理。
-iptables -N DOCKER-USER 2>/dev/null || true
-iptables -C FORWARD -j DOCKER-USER 2>/dev/null ||
-    iptables -I FORWARD 1 -j DOCKER-USER
-
-iptables -C DOCKER-USER -j RETURN 2>/dev/null ||
-    iptables -A DOCKER-USER -j RETURN
-
-# 注意：不在这里手动开放全部 Docker 转发流量。
-# 由 Docker 自身的网络规则及 1Panel 后续配置管理。
-
-# ------------------------------------------------------------
-# 6. 防火墙规则持久化
-# ------------------------------------------------------------
-echo -e "${GREEN}[6/6] 持久化防火墙规则${NC}"
-
-mkdir -p /etc/iptables
-
-iptables-save > /etc/iptables/rules.v4
-ip6tables-save > /etc/iptables/rules.v6
-
-systemctl enable netfilter-persistent >/dev/null 2>&1
-systemctl restart netfilter-persistent
-
-# ------------------------------------------------------------
-# 完成
+# 8. 输出结果
 # ------------------------------------------------------------
 echo
-echo -e "${GREEN}初始化完成！${NC}"
-echo "=============================================="
-echo "系统版本：${PRETTY_NAME}"
-echo "默认网卡：${DEFAULT_ETH}"
-echo "MTU：$(ip -o link show dev "$DEFAULT_ETH" |
-    sed -n 's/.*mtu \([0-9]*\).*/\1/p')"
-echo "TCP 拥塞控制：${CURRENT_CC}"
-echo "队列算法：${CURRENT_QDISC}"
-echo "入站默认策略：DROP"
-echo "TCP 放行：22 / 80 / 443 / 65510"
-echo "UDP 放行：500 / 4500（WiFi Calling）"
-echo "IPv4 / IPv6：已配置"
-echo "规则持久化：netfilter-persistent"
-echo "=============================================="
+echo -e "${GREEN}"
+echo "============================================================"
+echo " 初始化完成"
+echo "============================================================"
+echo -e "${NC}"
+
+echo "系统版本       : ${PRETTY_NAME}"
+echo "CPU 架构       : ${ARCH}"
+echo "默认网卡       : ${DEFAULT_ETH}"
+echo "当前 MTU       : $(cat "/sys/class/net/$DEFAULT_ETH/mtu")"
+echo "BBR 可用算法   : ${AVAILABLE_CC:-未知}"
+echo "当前拥塞控制   : $(sysctl -n net.ipv4.tcp_congestion_control)"
+echo "当前队列算法   : $(sysctl -n net.core.default_qdisc)"
+echo "备份目录       : ${BACKUP_DIR}"
+
+echo
+echo "防火墙处理     : 未修改"
+echo "Docker 规则    : 未修改"
+echo "SSH 配置       : 未修改"
+echo "IPv6 地址/路由 : 未修改"
+echo
+echo "端口规划（不自动放行）："
+echo "  当前 SSH     : TCP 22"
+echo "  1Panel       : TCP 65510"
+echo "  未来 SSH     : TCP 65511"
+echo
+echo -e "${YELLOW}后续建议：${NC}"
+echo "1. 检查 OCI NSG / 安全列表中的入站规则。"
+echo "2. 安装 1Panel。"
+echo "3. 首次进入 1Panel 防火墙页面时执行初始化。"
+echo "4. 应用端口和 SSH 端口变更由 1Panel / SSH 配置单独管理。"
+echo
+echo -e "${GREEN}完成。${NC}"
 echo
 echo -e "${YELLOW}后续操作：${NC}"
 echo "1. OCI VCN 安全列表/NSG 检查相应入站规则"
