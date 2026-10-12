@@ -1,298 +1,253 @@
+
 #!/usr/bin/env bash
-# ============================================================
 # OCI Ubuntu 26.04 LTS 基础初始化
-#
-# 适用：Oracle Cloud ARM / AMD Ubuntu 26.04
-# 功能：
-#   1. 检查系统版本、权限和 CPU 架构
-#   2. 自动识别默认网卡
-#   3. Netplan 持久化 MTU 1500
-#   4. TCP BBR + fq（内核支持时启用）
-#   5. 备份配置、验证执行结果
-#
-# 防火墙策略：
-#   - 不清空 iptables / ip6tables / nftables
-#   - 不修改默认防火墙策略
-#   - 不创建 1PANEL_* 或 DOCKER-USER 链
-#   - 不安装或启用 iptables-persistent
-#   - 不修改 SSH 端口或放行任何入站端口
-#
-# 端口规划：
-#   当前 SSH：22
-#   1Panel：65510
-#   未来 SSH：65511
-#
-# 建议在新实例安装 1Panel 前运行
-# ============================================================
+# 功能：MTU 1500、IPv6 自动配置、BBR + fq
+# 防火墙：只检查，不修改 iptables / ip6tables / nftables
+# 适用架构：ARM64 / AMD64
+# 不重启系统，不安装或初始化 1Panel
 
 set -Eeuo pipefail
 umask 077
 
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
+readonly SCRIPT_NAME="oci-ubuntu-init"
+readonly NETPLAN_FILE="/etc/netplan/99-oci-init.yaml"
+readonly SYSCTL_FILE="/etc/sysctl.d/99-oci-init.conf"
 
-log()  { echo -e "${GREEN}[INFO]${NC} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
-die()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+log()  { printf '[INFO] %s\n' "$*"; }
+warn() { printf '[WARN] %s\n' "$*" >&2; }
+die()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
-trap 'rc=$?; echo -e "${RED}[ERROR] 第 ${LINENO} 行执行失败，退出码 ${rc}${NC}" >&2; exit "$rc"' ERR
+# ---------- 1. 基础检查 ----------
 
-echo -e "${GREEN}"
-echo "============================================================"
-echo " OCI Ubuntu 26.04 基础初始化"
-echo " 防火墙交由后续 1Panel 初始化和管理"
-echo "============================================================"
-echo -e "${NC}"
+[[ "${EUID}" -eq 0 ]] || die "请使用 root 权限运行。"
 
-# ------------------------------------------------------------
-# 1. 权限与系统版本检查
-# ------------------------------------------------------------
-[[ "$EUID" -eq 0 ]] || die "请使用 root 运行：sudo -i"
-
-[[ -r /etc/os-release ]] || die "无法读取系统版本信息"
+[[ -r /etc/os-release ]] || die "无法读取 /etc/os-release。"
 # shellcheck disable=SC1091
 source /etc/os-release
 
-[[ "${ID:-}" == "ubuntu" ]] ||
-    die "仅支持 Ubuntu，当前系统：${PRETTY_NAME:-unknown}"
+[[ "${ID:-}" == "ubuntu" ]] || die "本脚本只支持 Ubuntu。"
+[[ "${VERSION_ID:-}" == "26.04" ]] || \
+    die "当前系统版本为 ${VERSION_ID:-未知}，本脚本仅针对 Ubuntu 26.04 LTS。"
 
-[[ "${VERSION_ID:-}" == "26.04" ]] ||
-    die "本脚本仅支持 Ubuntu 26.04，当前：${VERSION_ID:-unknown}"
-
-ARCH="$(dpkg --print-architecture)"
+ARCH="$(dpkg --print-architecture 2>/dev/null || true)"
 case "$ARCH" in
     arm64|amd64) ;;
-    *) die "不支持的 CPU 架构：$ARCH（仅支持 arm64 / amd64）" ;;
+    *) die "不支持的 CPU 架构：${ARCH:-未知}。" ;;
 esac
 
-for cmd in ip awk grep sysctl apt-get dpkg; do
-    command -v "$cmd" >/dev/null 2>&1 ||
-        die "缺少必要命令：$cmd"
-done
+command -v ip >/dev/null 2>&1 || die "未找到 ip 命令。"
+command -v netplan >/dev/null 2>&1 || die "未找到 netplan，请先检查系统网络组件。"
 
-# ------------------------------------------------------------
-# 2. 自动识别默认网卡
-# ------------------------------------------------------------
-log "检测默认网卡"
+[[ -d /etc/netplan ]] || die "/etc/netplan 目录不存在。"
 
-DEFAULT_ETH="$(
+# 避免覆盖已有的同名文件
+[[ ! -e "$NETPLAN_FILE" ]] || \
+    die "$NETPLAN_FILE 已存在。为避免覆盖现有配置，脚本已停止；请先检查该文件。"
+
+# ---------- 2. 自动识别默认网卡 ----------
+
+DEFAULT_IFACE="$(
     ip -4 route show default 2>/dev/null |
-    awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}'
+    awk 'NR == 1 {
+        for (i = 1; i <= NF; i++) {
+            if ($i == "dev") {
+                print $(i + 1)
+                exit
+            }
+        }
+    }'
 )"
 
-if [[ -z "$DEFAULT_ETH" ]]; then
-    DEFAULT_ETH="$(
+if [[ -z "$DEFAULT_IFACE" ]]; then
+    DEFAULT_IFACE="$(
         ip -6 route show default 2>/dev/null |
-        awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}'
+        awk 'NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "dev") {
+                    print $(i + 1)
+                    exit
+                }
+            }
+        }'
     )"
 fi
 
-[[ -n "$DEFAULT_ETH" ]] || die "未找到 IPv4 或 IPv6 默认路由"
-[[ -e "/sys/class/net/$DEFAULT_ETH" ]] ||
-    die "网卡不存在：$DEFAULT_ETH"
+[[ -n "$DEFAULT_IFACE" ]] || die "无法识别默认网卡，请检查实例网络。"
+ip link show dev "$DEFAULT_IFACE" >/dev/null 2>&1 || \
+    die "识别出的网卡不存在：$DEFAULT_IFACE"
 
-MAC="$(cat "/sys/class/net/$DEFAULT_ETH/address")"
-[[ -n "$MAC" ]] || die "无法读取网卡 MAC 地址"
+log "系统版本：Ubuntu ${VERSION_ID}"
+log "CPU 架构：${ARCH}"
+log "默认网卡：${DEFAULT_IFACE}"
 
-log "系统：${PRETTY_NAME}"
-log "架构：${ARCH}"
-log "默认网卡：${DEFAULT_ETH}"
-log "MAC 地址：${MAC}"
+# ---------- 3. 创建备份 ----------
 
-ip -brief address show dev "$DEFAULT_ETH"
-
-# ------------------------------------------------------------
-# 3. 备份配置
-# ------------------------------------------------------------
 STAMP="$(date +%Y%m%d-%H%M%S)"
-BACKUP_DIR="/root/oci-init-backup-${STAMP}"
+BACKUP_DIR="/root/oci-ubuntu-init-backup-${STAMP}"
 
-mkdir -m 700 -p "$BACKUP_DIR"
-
-NETPLAN_DIR="/etc/netplan"
-NETPLAN_FILE="${NETPLAN_DIR}/99-oci-init.yaml"
-SYSCTL_FILE="/etc/sysctl.d/99-oci-init.conf"
-
-mkdir -p "$NETPLAN_DIR"
-
-# 备份现有 Netplan 文件和本脚本涉及的 sysctl 文件
-if compgen -G "${NETPLAN_DIR}/*.yaml" >/dev/null; then
-    tar -czf "${BACKUP_DIR}/netplan-backup.tar.gz" \
-        -C /etc netplan
-fi
-
-if [[ -e "$NETPLAN_FILE" ]]; then
-    cp -a "$NETPLAN_FILE" "${BACKUP_DIR}/99-oci-init.yaml"
-fi
+mkdir -p "$BACKUP_DIR"
+cp -a /etc/netplan "$BACKUP_DIR/netplan"
 
 if [[ -e "$SYSCTL_FILE" ]]; then
-    cp -a "$SYSCTL_FILE" "${BACKUP_DIR}/99-oci-init.conf"
+    cp -a "$SYSCTL_FILE" "$BACKUP_DIR/99-oci-init.conf"
 fi
 
-log "配置备份目录：${BACKUP_DIR}"
+log "原始配置已备份到：$BACKUP_DIR"
 
-# ------------------------------------------------------------
-# 4. 检查 Netplan
-# ------------------------------------------------------------
-if ! command -v netplan >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y netplan.io
-fi
+# ---------- 4. 添加 Netplan 补充配置 ----------
+# 不指定 dhcp4，避免覆盖现有 IPv4 配置。
+# 不指定静态 IPv6 地址或 IPv6 网关。
+# Netplan 会将该文件与其他配置文件合并。
 
-command -v netplan >/dev/null 2>&1 ||
-    die "Netplan 安装失败"
-
-# ------------------------------------------------------------
-# 5. Netplan 持久化 MTU 1500
-# ------------------------------------------------------------
-log "配置 MTU 1500"
-
-TMP_FILE="${NETPLAN_FILE}.tmp"
-
-cat > "$TMP_FILE" <<EOF
+cat > "$NETPLAN_FILE" <<EOF
 network:
   version: 2
   ethernets:
-    ${DEFAULT_ETH}:
+    ${DEFAULT_IFACE}:
       mtu: 1500
+      dhcp6: true
+      accept-ra: true
 EOF
 
-chmod 600 "$TMP_FILE"
-mv "$TMP_FILE" "$NETPLAN_FILE"
+chmod 600 "$NETPLAN_FILE"
 
-# 验证合并后的 Netplan 配置
-if ! netplan generate; then
-    warn "Netplan 验证失败，恢复本脚本原有配置"
+rollback_netplan() {
+    warn "正在尝试恢复 Netplan 配置……"
+    rm -f "$NETPLAN_FILE"
 
-    if [[ -e "${BACKUP_DIR}/99-oci-init.yaml" ]]; then
-        cp -a "${BACKUP_DIR}/99-oci-init.yaml" "$NETPLAN_FILE"
+    if netplan generate; then
+        netplan apply || warn "恢复后的 netplan apply 失败，请通过 OCI 控制台检查网络。"
     else
-        rm -f "$NETPLAN_FILE"
+        warn "恢复后的 netplan generate 失败，请通过 OCI 控制台检查配置。"
     fi
+}
 
-    netplan generate || true
-    die "Netplan 配置验证失败，已尝试回滚"
+if ! netplan generate; then
+    rollback_netplan
+    die "Netplan 配置校验失败，已尝试恢复。"
 fi
 
-# 先设置当前 MTU，再应用持久化配置
-ip link set dev "$DEFAULT_ETH" mtu 1500
+log "Netplan 配置校验通过，正在应用网络设置……"
 
 if ! netplan apply; then
-    warn "netplan apply 失败，尝试恢复本脚本之前的配置"
-
-    if [[ -e "${BACKUP_DIR}/99-oci-init.yaml" ]]; then
-        cp -a "${BACKUP_DIR}/99-oci-init.yaml" "$NETPLAN_FILE"
-    else
-        rm -f "$NETPLAN_FILE"
-    fi
-
-    netplan generate || true
-    netplan apply || true
-
-    die "Netplan 应用失败，请通过 OCI 控制台检查网络"
+    rollback_netplan
+    die "Netplan 应用失败，已尝试恢复。"
 fi
 
-CURRENT_MTU="$(cat "/sys/class/net/$DEFAULT_ETH/mtu")"
-[[ "$CURRENT_MTU" == "1500" ]] ||
-    die "MTU 验证失败，当前值：${CURRENT_MTU}"
+log "MTU 1500 和 IPv6 自动配置已写入并应用。"
 
-log "MTU 当前值：${CURRENT_MTU}"
-log "持久化配置：${NETPLAN_FILE}"
-
-# ------------------------------------------------------------
-# 6. TCP BBR + fq
-# ------------------------------------------------------------
-log "检测内核 BBR 支持"
-
-modprobe tcp_bbr 2>/dev/null || true
+# ---------- 5. 启用 BBR + fq ----------
+# 仅在内核明确支持 BBR 时配置，不安装第三方内核或工具。
 
 AVAILABLE_CC="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
 
-if awk -v cc="$AVAILABLE_CC" '
-    BEGIN {
-        n = split(cc, a, /[[:space:]]+/)
-        for (i=1; i<=n; i++) if (a[i] == "bbr") found=1
-        exit !found
-    }'
-then
+if printf '%s\n' "$AVAILABLE_CC" | grep -qw bbr; then
     cat > "$SYSCTL_FILE" <<'EOF'
-# OCI 基础 TCP 优化
+# OCI Ubuntu basic TCP tuning
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
+    chmod 600 "$SYSCTL_FILE"
 
-    chmod 644 "$SYSCTL_FILE"
-    sysctl -p "$SYSCTL_FILE"
-
-    CURRENT_CC="$(sysctl -n net.ipv4.tcp_congestion_control)"
-    CURRENT_QDISC="$(sysctl -n net.core.default_qdisc)"
-
-    [[ "$CURRENT_CC" == "bbr" ]] ||
-        die "BBR 配置未生效"
-    [[ "$CURRENT_QDISC" == "fq" ]] ||
-        warn "fq 未能按预期生效，当前值：${CURRENT_QDISC}"
-
-    log "BBR：${CURRENT_CC}"
-    log "队列算法：${CURRENT_QDISC}"
+    if sysctl -p "$SYSCTL_FILE" >/dev/null; then
+        log "BBR + fq 已启用并持久化。"
+    else
+        warn "BBR 参数应用失败，请检查内核及 sysctl 状态。"
+    fi
 else
-    warn "当前内核未报告支持 BBR，本脚本不强制设置"
-    warn "保留现有拥塞控制配置，不覆盖其他 sysctl 参数"
+    warn "当前内核未报告支持 BBR，跳过 BBR 配置。"
 fi
 
-# ------------------------------------------------------------
-# 7. 防火墙安全检查（只检查，不修改）
-# ------------------------------------------------------------
-log "检查防火墙状态（不会修改规则）"
+# ---------- 6. 防火墙只读检查 ----------
+# 不执行任何规则增删、清空、保存或服务启停操作。
+
+printf '\n===== 防火墙只读检查 =====\n'
 
 if command -v iptables >/dev/null 2>&1; then
-    iptables -S INPUT 2>/dev/null || true
+    log "iptables："
+    iptables -S INPUT 2>/dev/null | head -n 12 || true
 else
-    warn "未发现 iptables 命令"
+    log "未安装 iptables 命令。"
 fi
 
 if command -v ip6tables >/dev/null 2>&1; then
-    ip6tables -S INPUT 2>/dev/null || true
+    log "ip6tables："
+    ip6tables -S INPUT 2>/dev/null | head -n 12 || true
 else
-    warn "未发现 ip6tables 命令"
+    log "未安装 ip6tables 命令。"
 fi
 
 if command -v nft >/dev/null 2>&1; then
-    nft list ruleset 2>/dev/null || true
+    log "nftables：仅检查规则集是否可读取。"
+    nft list ruleset >/dev/null 2>&1 \
+        && log "nftables 规则集可读取。" \
+        || log "nftables 规则集为空或当前不可读取。"
+else
+    log "未安装 nft 命令。"
 fi
 
-# ------------------------------------------------------------
-# 8. 输出结果
-# ------------------------------------------------------------
-echo
-echo -e "${GREEN}"
-echo "============================================================"
-echo " 初始化完成"
-echo "============================================================"
-echo -e "${NC}"
+# ---------- 7. 重新检查 IPv6 ----------
+# 地址、路由和外网连通性分别判断，避免单项失败就下结论。
 
-echo "系统版本       : ${PRETTY_NAME}"
-echo "CPU 架构       : ${ARCH}"
-echo "默认网卡       : ${DEFAULT_ETH}"
-echo "当前 MTU       : $(cat "/sys/class/net/$DEFAULT_ETH/mtu")"
-echo "BBR 可用算法   : ${AVAILABLE_CC:-未知}"
-echo "当前拥塞控制   : $(sysctl -n net.ipv4.tcp_congestion_control)"
-echo "当前队列算法   : $(sysctl -n net.core.default_qdisc)"
-echo "备份目录       : ${BACKUP_DIR}"
+printf '\n===== IPv6 检查 =====\n'
 
-echo
-echo "防火墙处理     : 未修改"
-echo "Docker 规则    : 未修改"
-echo "SSH 配置       : 未修改"
-echo "IPv6 地址/路由 : 未修改"
-echo
-echo "端口规划（不自动放行）："
-echo "  当前 SSH     : TCP 22"
-echo "  1Panel       : TCP 65510"
-echo "  未来 SSH     : TCP 65511"
+GLOBAL_V6="$(
+    ip -6 -o address show dev "$DEFAULT_IFACE" scope global 2>/dev/null |
+    awk '{print $4}' || true
+)"
+
+V6_DEFAULT_ROUTE="$(
+    ip -6 route show default dev "$DEFAULT_IFACE" 2>/dev/null || true
+)"
+
+if [[ -n "$GLOBAL_V6" ]]; then
+    printf '全球单播 IPv6 地址：\n%s\n' "$GLOBAL_V6"
+else
+    warn "暂未发现全球单播 IPv6 地址。"
+fi
+
+if [[ -n "$V6_DEFAULT_ROUTE" ]]; then
+    printf 'IPv6 默认路由：\n%s\n' "$V6_DEFAULT_ROUTE"
+else
+    warn "暂未发现该网卡的 IPv6 默认路由。"
+fi
+
+if command -v curl >/dev/null 2>&1; then
+    if [[ -n "$GLOBAL_V6" && -n "$V6_DEFAULT_ROUTE" ]]; then
+        if V6_TEST="$(curl -6 -fsS --connect-timeout 5 --max-time 8 \
+            https://api6.ipify.org 2>/dev/null)"; then
+            log "IPv6 外网连通性测试成功：${V6_TEST}"
+        else
+            warn "IPv6 外网连通性测试失败；请结合路由、DNS 和 OCI 网络设置排查。"
+        fi
+    else
+        warn "缺少 IPv6 地址或默认路由，跳过外网连通性测试。"
+    fi
+else
+    log "未安装 curl，跳过 IPv6 外网连通性测试。"
+fi
+
+# ---------- 8. 最终状态 ----------
+
+printf '\n===== 初始化完成 =====\n'
+printf '系统：Ubuntu %s (%s)\n' "$VERSION_ID" "$ARCH"
+printf '默认网卡：%s\n' "$DEFAULT_IFACE"
+printf '当前 MTU：'
+ip -o link show dev "$DEFAULT_IFACE" | sed -n 's/.*mtu \([0-9]*\).*/\1/p'
+
+printf '当前拥塞控制算法：'
+sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true
+
+printf '当前默认队列算法：'
+sysctl -n net.core.default_qdisc 2>/dev/null || true
+
+printf '备份目录：%s\n' "$BACKUP_DIR"
+printf '\n防火墙规则未被本脚本修改。\n'
+printf '未重启系统；建议确认 SSH 连接正常后再安装 1Panel。\n'
+
+# ------------------------------------------------------------
+# 9. 输出结果
+# ------------------------------------------------------------
 echo
 echo -e "${YELLOW}后续建议：${NC}"
 echo "1. 检查 OCI NSG / 安全列表中的入站规则。"
